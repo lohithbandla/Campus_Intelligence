@@ -9,9 +9,9 @@ import { GoogleGenerativeAI } from "@google/generative-ai";
 
 const router = express.Router();
 
-// Initialize Gemini using API Key from .env
+// ------------------ Gemini Ask Route ------------------
 if (!process.env.GEMINI_API_KEY) {
-  throw new Error('GEMINI_API_KEY is not set. Please define it in your .env file.');
+  throw new Error('GEMINI_API_KEY is not set in .env');
 }
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
@@ -19,7 +19,6 @@ const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
 router.post("/ask", async (req, res) => {
   try {
     const userMessage = req.body.message;
-
     const result = await model.generateContent(userMessage);
 
     res.json({
@@ -36,32 +35,33 @@ router.post("/ask", async (req, res) => {
   }
 });
 
-
-
+// ------------------ Helper: Extract SQL Params ------------------
 const getQueryParams = (sql, userRole, userId) => {
-  const paramMatches = sql.match(/\$\d+/g) || [];
-  const paramCount = paramMatches.length > 0 
-    ? Math.max(...paramMatches.map(p => parseInt(p.replace('$', ''))))
+  const matches = sql.match(/\$\d+/g) || [];
+  const paramCount = matches.length > 0
+    ? Math.max(...matches.map(p => parseInt(p.replace('$', ''))))
     : 0;
 
   if (paramCount === 0) return [];
 
-  // STRICT RESTRICTION: Students and Faculty MUST use parameters for their ID
+  // Students & faculty MUST have $1 bound to their ID
   if (['student', 'faculty'].includes(userRole)) {
     return Array(paramCount).fill(userId);
   }
 
-  // RELAXED: Admin and Department usually don't need params.
-  // But if the AI hallucinated a '$1' in the SQL, we fill it to prevent a crash.
+  // For admin/department (rare case of $1 appearing)
   return Array(paramCount).fill(userId);
 };
 
+// ------------------ MAIN LLM SQL Route ------------------
 router.post(
   '/query',
   authenticate,
   authorizeRoles('student', 'faculty', 'admin', 'department'),
   body('query').notEmpty().withMessage('Query is required'),
   async (req, res) => {
+
+    // Validate input body
     const errors = validationResult(req);
     if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
 
@@ -69,42 +69,49 @@ router.post(
     const { id: userId, role: userRole } = req.user;
 
     try {
+      // 1️⃣ Generate SQL using Gemini
       let sql = await generateSQL(query, userRole, userId);
 
-      if (sql === 'NON_SQL_INTENT') {
+      // Handle non-SQL messages cleanly
+      if (sql === "NON_SQL_INTENT") {
         return res.json({
           success: true,
           query,
           sql: null,
-          response: "Hello! Ask me about students, faculty, marks, or circulars.",
+          response: "Hello! Ask me about students, faculty, marks, courses, or activities.",
           data: [],
           count: 0
         });
       }
 
+      // 2️⃣ Clean SQL (remove comments, safety)
       sql = sanitizeSQL(sql);
-      
-      // Fix Gemini SQL column name mismatches
-      sql = sql.replace(/subject_code/gi, 'course_code');
-      sql = sql.replace(/\bsubject\b/gi, 'course_name');
-      sql = sql.replace(/fc\.subject_code/gi, 'fc.course_code');
-      
-      // Pass role to validator to enforce strictness only for Student/Faculty
+
+      // ❗ IMPORTANT: We DO NOT replace ANY column names anymore.
+      // GeminiService + Validator now handle correct mappings.
+
+      // 3️⃣ Validate SQL safely based on role
       validateSQL(sql, userRole);
 
+      // 4️⃣ Prepare params ($1, $2, etc.)
       const queryParams = getQueryParams(sql, userRole, userId);
 
+      // 5️⃣ Execute query
       const result = await pool.query(sql, queryParams);
       const rows = result.rows || [];
-      const botResponse = await formatResponse(query, sql, rows);
 
-      // Save History (Non-blocking)
+      // 6️⃣ Get formatted explanation from Gemini
+      const botResponse = await formatResponse(query, sql, rows, userRole);
+
+      // 7️⃣ Save history (non-blocking)
       pool.query(
-        `INSERT INTO chat_history (user_id, user_type, user_query, generated_sql, bot_response, result_data)
-         VALUES ($1, $2, $3, $4, $5, $6)`,
+        `INSERT INTO chat_history
+        (user_id, user_type, user_query, generated_sql, bot_response, result_data)
+        VALUES ($1, $2, $3, $4, $5, $6)`,
         [userId, userRole, query, sql, botResponse, JSON.stringify(rows)]
-      ).catch(err => console.error("History Error:", err.message));
+      ).catch(err => console.error("History Save Error:", err.message));
 
+      // 8️⃣ Send result to frontend
       res.json({
         success: true,
         query,
@@ -115,13 +122,13 @@ router.post(
       });
 
     } catch (error) {
-      console.error('Chat Error:', error);
+      console.error("Chat Error:", error);
       res.status(500).json({ success: false, message: error.message });
     }
   }
 );
 
-// GET /api/chat/history - Get chat history for authenticated user
+// ------------------ Get Chat History ------------------
 router.get('/history', authenticate, async (req, res) => {
   try {
     const limit = parseInt(req.query.limit || '10', 10);
@@ -132,28 +139,38 @@ router.get('/history', authenticate, async (req, res) => {
        LIMIT $3`,
       [req.user.id, req.user.role, limit]
     );
+
     res.json({ success: true, history: result.rows });
+
   } catch (err) {
     console.error('Chat history error:', err);
-    res.status(500).json({ success: false, message: 'Failed to load chat history', error: err.message });
+    res.status(500).json({ success: false, message: 'Failed to load chat history' });
   }
 });
 
-// Download Route (Simplified for brevity, logic matches above)
+// ------------------ Excel Download Route ------------------
 router.post('/download', authenticate, async (req, res) => {
-    const { query, sql } = req.body;
-    const { id: userId, role: userRole } = req.user;
-    try {
-      validateSQL(sql, userRole); // Validate again
-      const queryParams = getQueryParams(sql, userRole, userId);
-      const result = await pool.query(sql, queryParams);
-      const { buffer, filename } = await generateExcel(result.rows || [], query, userRole);
-      res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-      res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-      res.send(buffer);
-    } catch (error) {
-      res.status(500).json({ success: false, message: 'Download failed' });
-    }
+  const { query, sql } = req.body;
+  const { id: userId, role: userRole } = req.user;
+
+  try {
+    validateSQL(sql, userRole);
+    const queryParams = getQueryParams(sql, userRole, userId);
+    const result = await pool.query(sql, queryParams);
+
+    const { buffer, filename } = await generateExcel(result.rows || [], query, userRole);
+
+    res.setHeader('Content-Type',
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    );
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+
+    res.send(buffer);
+
+  } catch (error) {
+    console.error("Download error:", error);
+    res.status(500).json({ success: false, message: 'Download failed' });
+  }
 });
 
 export default router;

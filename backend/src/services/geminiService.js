@@ -1,112 +1,160 @@
 import { GoogleGenerativeAI } from '@google/generative-ai';
 
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY; 
-if (!GEMINI_API_KEY) { console.warn("Warning: GEMINI_API_KEY is missing in .env"); }
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+if (!GEMINI_API_KEY) { 
+  console.warn("Warning: GEMINI_API_KEY is missing in .env"); 
+}
 
-// Switched back to 'gemini-pro' as 'gemini-1.5-flash' was giving 404s for you
-const genAI = new GoogleGenerativeAI(GEMINI_API_KEY || 'AIzaSyCdgStLZVzbIXJqiUglgNWYimClAesWpZs');
+const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
 
+// ----------------------------------------------------------------------
+// STRICT DATABASE SCHEMA CONTEXT (Corrected + Hallucination-Proof)
+// ----------------------------------------------------------------------
 const SCHEMA_CONTEXT = `
-Database Schema for college-management (PostgreSQL):
+PostgreSQL Database Schema for college-management:
 
-TABLES & COLUMNS:
-1. student (student_id, usn, name, email, department_id, address) -- Removed 'phone' to avoid error
-2. faculty (faculty_id, faculty_name, email, department_id) -- Removed 'phone' to avoid error
-3. department (department_id, department_name)
-4. marks_student (mark_id, student_id, student_name, semester, subject_code, subject_name, internal_marks, external_marks, total_marks, result)
-5. faculty_courses (course_id, faculty_id, course_name, subject_code, semester, academic_year)
-6. department_circulars (circular_id, department_id, title, circular_details)
-7. student_leave_requests (leave_id, student_id, leave_details, status, from_date)
-8. department_activities (event_id, department_id, event_title, event_date)
+TABLES:
+student(student_id, usn, name, email, department_id, address)
+faculty(faculty_id, faculty_name, email, department_id)
+department(department_id, department_name)
 
-RELATIONSHIPS:
-- Student -> Dept: student.department_id = department.department_id
-- Faculty -> Dept: faculty.department_id = department.department_id
-- Faculty -> Courses: faculty.faculty_id = faculty_courses.faculty_id
+marks_student(
+  mark_id, student_id, student_name, semester,
+  subject_code, subject_name,
+  internal_marks, external_marks, total_marks, result
+)
 
-ROLE RULES:
-- STUDENT: RESTRICTED. Can ONLY see their own data. MUST use "WHERE student_id = $1".
-- FACULTY: RESTRICTED. Can ONLY see their own data. MUST use "WHERE faculty_id = $1" (or join on it).
-- DEPARTMENT: FULL ACCESS. Can see all students and faculty. Do NOT use parameters like $1.
-- ADMIN: FULL ACCESS. Can see all tables. Do NOT use parameters like $1.
+faculty_courses(
+  course_id, faculty_id,
+  course_name, course_code, materials,
+  semester, academic_year
+)
 
-ENUMS (Use EXACTLY these lowercase values):
-- status: 'approved', 'pending', 'rejected'
-- result: 'pass', 'fail'
+department_circulars(circular_id, department_id, title, circular_details, file_path, timestamp, created_by)
+student_leave_requests(leave_id, student_id, leave_details, status, from_date)
+department_activities(event_id, department_id, event_title, event_details, event_date, timestamp, created_by)
+
+RULES:
+- marks_student uses subject_code.
+- faculty_courses uses course_code.
+- NEVER swap subject_code and course_code.
+- Students ALWAYS must use: WHERE student_id = $1
+- Faculty ALWAYS must use: WHERE faculty_id = $1
+- NEVER use literal IDs like 1, 2, etc. Always placeholders.
 `;
 
+// ----------------------------------------------------------------------
+// SQL GENERATOR WITH FULL LOGGING + AUTO PARAM FIX
+// ----------------------------------------------------------------------
 export const generateSQL = async (userQuery, userRole, userId) => {
   try {
-    const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
+    const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
 
-    // SIMPLIFIED PROMPTS
     const roleInstructions = {
-      // STRICT RESTRICTIONS
-      student: `You are a STUDENT (ID: ${userId}). You are strictly limited to your own data. ALWAYS add "WHERE student_id = $1".`,
-      faculty: `You are a FACULTY member (ID: ${userId}). You are strictly limited to your own records. ALWAYS add "WHERE faculty_id = $1" for personal/course data.`,
-      
-      // REMOVED RESTRICTIONS
-      department: `You are a DEPARTMENT HEAD. You have access to ALL student and faculty data. Do NOT use $1. Generate standard SQL without ID filters.`,
-      admin: `You are an ADMIN. You have access to EVERYTHING. Do NOT use $1. Generate standard SQL without ID filters.`
+      student: `
+You are a student. You must ALWAYS filter your data using:
+WHERE student_id = $1
+Never use literal numbers like student_id = 1.
+      `,
+      faculty: `
+You are a faculty member. You must ALWAYS filter using:
+WHERE faculty_id = $1
+Never use literal numbers.
+      `,
+      department: `You are a department head. You have full access.`,
+      admin: `You are an admin. Full database access.`
     };
 
     const prompt = `
 ${SCHEMA_CONTEXT}
 
-${roleInstructions[userRole] || roleInstructions.admin}
+${roleInstructions[userRole]}
 
 User Query: "${userQuery}"
 
-Generate a valid PostgreSQL SELECT query.
-Rules:
-1. Output ONLY the raw SQL. No markdown.
-2. If the user says "Hi", "Hello" or asks non-data questions, output exactly: NON_SQL_INTENT
-3. Use lowercase for enums ('pending', 'approved').
-4. Use CURRENT_DATE for date comparisons.
+TASK:
+Convert the above into a PostgreSQL SELECT query.
+
+RULES:
+1. Output ONLY SQL.
+2. Never output literal IDs (1, 2...). Always use $1 when needed.
+3. Use correct columns per table.
+4. If user says 'hi', return: NON_SQL_INTENT.
 
 SQL:
 `;
 
-    const result = await model.generateContent(prompt);
-    const response = await result.response;
-    let sql = response.text().trim();
+    // ---------------- DEBUG: Log Prompt ----------------
+    console.log("\n================= GEMINI PROMPT =================");
+    console.log(prompt);
+    console.log("==================================================\n");
 
-    sql = sql.replace(/```sql/g, '').replace(/```/g, '').trim();
+    const result = await model.generateContent(prompt);
+    let sql = result.response.text().trim();
+
+    // ---------------- DEBUG: RAW SQL ----------------
+    console.log("🔍 RAW GEMINI SQL:", sql);
+
+    // Remove markdown wrapping
+    sql = sql.replace(/```sql|```/g, "").trim();
+
+    // AUTO FIX: Convert literal student_id = 1 → $1
+    if (userRole === "student") {
+      sql = sql.replace(/student_id\s*=\s*\d+/i, "student_id = $1");
+    }
+
+    // AUTO FIX: Convert literal faculty_id = 1 → $1
+    if (userRole === "faculty") {
+      sql = sql.replace(/faculty_id\s*=\s*\d+/i, "faculty_id = $1");
+    }
+
+    // ---------------- DEBUG: FINAL FIXED SQL ----------------
+    console.log("✅ FINAL SQL (AFTER FIXES):", sql);
+
     return sql;
-  } catch (error) {
-    console.error('Gemini API Error:', error);
-    throw new Error('AI Service Failed: ' + error.message);
+
+  } catch (err) {
+    console.error("❌ Gemini SQL Generation Error:", err);
+    throw new Error("AI Service Failed: " + err.message);
   }
 };
 
+// ----------------------------------------------------------------------
+// FORMAT RESPONSE — FULL LOGGING
+// ----------------------------------------------------------------------
 export const formatResponse = async (userQuery, sql, results, userRole) => {
   try {
-    const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
+    const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
 
     const prompt = `
-    You are a helper bot explaining database results to a user with role: ${userRole.toUpperCase()}.
+Summarize these database results for a ${userRole.toUpperCase()}.
 
-    User Question: "${userQuery}"
-    SQL Executed: "${sql}"
-    Row Count: ${results.length}
-    Data Preview: ${JSON.stringify(results.slice(0, 3))}
+User Query: "${userQuery}"
+SQL: "${sql}"
+Row Count: ${results.length}
+Data: ${JSON.stringify(results.slice(0, 3))}
 
-    INSTRUCTIONS:
-    1. If Row Count is > 0: Summarize the data friendly (e.g., "Here are the 5 students found.").
-    
-    2. If Row Count is 0 (CRITICAL):
-       - Analyze the User Question vs. their Role.
-       - If a STUDENT asked for Faculty/Department/Admin data: Reply exactly "You do not have access to this data."
-       - If a FACULTY asked for other Faculty's data: Reply exactly "You do not have access to this data."
-       - If the query was valid but just empty (e.g., "My marks" but no marks exist): Reply "No data available for this request."
-    
-    Keep the response brief and natural.
-    `;
+Rules:
+- If unauthorized → "You do not have access to this data."
+- If empty → "No data available for this request."
+- Keep summary short.
+`;
+
+    // DEBUG
+    console.log("\n========= GEMINI FORMAT RESPONSE PROMPT =========");
+    console.log(prompt);
+    console.log("=================================================\n");
 
     const result = await model.generateContent(prompt);
+
+    // DEBUG
+    console.log("📝 GEMINI SUMMARY:", result.response.text());
+
     return result.response.text();
-  } catch (error) {
-    // Fallback if AI fails
+
+  } catch (err) {
+    console.error("❌ Gemini Response Error:", err);
+
     if (results.length === 0) return "No data available or access restricted.";
     return `Found ${results.length} record(s).`;
   }
